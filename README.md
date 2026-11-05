@@ -60,6 +60,16 @@ the world `WORLD_ID` points at, then reindexes. It is idempotent.
 node scripts/seed.mjs
 ```
 
+## Seed the demo world
+
+`scripts/seed.mjs` loads a five-project demo graph (Ethan Davidson managing
+Wazoo, Worlds, docs.wazoo.dev, the SPARQL engine, and Wazoo Memorybench) into
+the world `WORLD_ID` points at, then reindexes. It is idempotent.
+
+```sh
+node scripts/seed.mjs
+```
+
 ## Notes
 
 - Keyword-only recall matches literal substrings, so pronoun-only follow-ups
