@@ -1,0 +1,4 @@
+node_modules/
+answer.pcm
+*.wav.tmp
+.env

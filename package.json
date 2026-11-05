@@ -1,0 +1,9 @@
+{
+  "dependencies": {
+    "@ai-sdk/deepseek": "3.0.80",
+    "@wazoo/tools": "npm:@jsr/wazoo__tools@^0.2.0",
+    "@worlds/client": "npm:@jsr/worlds__client@^0.8.0",
+    "ai": "7.0.163",
+    "assemblyai": "4.42.0"
+  }
+}
