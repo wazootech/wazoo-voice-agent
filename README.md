@@ -47,6 +47,16 @@ The pipeline is retrieve-then-speak rather than answer-then-speak:
 On a hosted world, the first word of the answer lands roughly four seconds
 after the question ends; follow-up turns reuse prefetch and land sooner.
 
+## Seed the demo world
+
+`scripts/seed.mjs` loads a five-project demo graph (Ethan Davidson managing
+Wazoo, Worlds, docs.wazoo.dev, the SPARQL engine, and Wazoo Memorybench) into
+the world `WORLD_ID` points at, then reindexes. It is idempotent.
+
+```sh
+node scripts/seed.mjs
+```
+
 ## Notes
 
 - Keyword-only recall matches literal substrings, so pronoun-only follow-ups
