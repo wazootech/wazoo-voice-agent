@@ -2,3 +2,7 @@ node_modules/
 answer.pcm
 *.wav.tmp
 .env
+*.wav
+*.pcm
+answer.pcm
+question*.wav

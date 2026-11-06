@@ -44,8 +44,11 @@ The pipeline is retrieve-then-speak rather than answer-then-speak:
   ends. The tool loop only runs when retrieval came up empty.
 - If a TTS session drops mid-reply, it reconnects and keeps speaking.
 
-On a hosted world, the first word of the answer lands roughly four seconds
-after the question ends; follow-up turns reuse prefetch and land sooner.
+Measured against a hosted world (keyword-only recall, deepseek-v4-flash):
+the first spoken word lands 10 to 20 seconds after the question ends,
+dominated by backend search-call variance (0.7 to 8 seconds per call
+observed). Follow-up turns reuse prefetch and land sooner. Enabling
+hybrid recall (embeddings) shortens retrieval further.
 
 ## Seed the demo world
 

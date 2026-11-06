@@ -219,8 +219,11 @@ async function runTurn(wavPath, tts) {
   console.error(`turn heard (${Date.now() - t}ms): "${finalText}"`);
 
   // Recall: reuse prefetch unless the final transcript changed materially.
+  // Reuse the prefetch unless the final transcript changed materially
+  // (STT spelling wobble like "Wazu"/"Wazoo" should not cost a re-run).
+  const norm = (t) => t.toLowerCase().replace(/[^a-z0-9]/g, "");
   let retrieved = prefetch ? await prefetch : null;
-  if (!retrieved || prefetchText !== finalText) {
+  if (!retrieved || norm(prefetchText) !== norm(finalText)) {
     retrieved = await retrieve(finalText);
   }
   console.error(
