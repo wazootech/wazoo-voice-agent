@@ -52,38 +52,42 @@ const PRONOUNS = new Set([
 
 const GREETINGS = new Set(["hey", "hi", "hello", "ok", "okay", "so", "well"]);
 
-function rewrite(question, history) {
-  // Collect the proper names the conversation has already established.
-  // Answers only: STT-mangled questions spell entities inconsistently.
-  const names = new Set();
-  for (const turn of history.slice(-3)) {
+// Capitalized only because they open a sentence, never an entity.
+const NOT_NAMES = new Set([
+  "the", "a", "an", "this", "that", "these", "those", "there", "here", "i",
+  "we", "you", "no", "yes", "sorry", "sure", "if", "and", "but", "so",
+  "however", "also", "only",
+]);
+
+// Pick ONE entity: the first real name in the most recent answer that has
+// one. Substituting several names let a stray sentence-opener ("The facts...")
+// hijack every pronoun.
+function pickEntity(history) {
+  for (const turn of history.slice(-3).reverse()) {
     for (const m of turn.answer.matchAll(
       /\b[A-Z][a-z]+(?: [A-Z][a-z]+)*\b/g,
     )) {
       const words = m[0].split(/\s+/);
-      while (words.length && GREETINGS.has(words[0].toLowerCase())) {
+      while (
+        words.length &&
+        (GREETINGS.has(words[0].toLowerCase()) ||
+          NOT_NAMES.has(words[0].toLowerCase()) ||
+          PRONOUNS.has(words[0].toLowerCase()))
+      ) {
         words.shift();
       }
-      const name = words.join(" ");
-      if (name && !PRONOUNS.has(name.toLowerCase())) names.add(name);
+      if (words.length) return words.join(" ");
     }
   }
-  let resolved = question;
-  for (const name of names) {
-    resolved = resolved.replace(
-      new RegExp(`\\b(his|her|its|their)\\b`, "gi"),
-      `${name}'s`,
-    );
-    resolved = resolved.replace(
-      new RegExp(`\\b(he|she|it|they)\\b`, "gi"),
-      name,
-    );
-    resolved = resolved.replace(
-      new RegExp(`\\b(him|her|it|them)\\b`, "gi"),
-      name,
-    );
-  }
-  return resolved;
+  return null;
+}
+
+function rewrite(question, history) {
+  const name = pickEntity(history);
+  if (!name) return question;
+  return question
+    .replace(/\b(his|her|its|their)\b/gi, `${name}'s`)
+    .replace(/\b(he|she|it|they|him|them)\b/gi, name);
 }
 
 const SUFFIXES = ["'s", "s", "es", "ing", "ed"];
