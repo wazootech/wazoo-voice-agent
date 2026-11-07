@@ -46,6 +46,15 @@ const recall = createRecallTools({ client: hosted });
 // Pre-pass calls go through raw fetch so the AbortController actually
 // cancels the HTTP request on supersede (the generated client drops the
 // signal). Tool-loop calls below keep using the hosted client.
+// Pre-pass result cache. Demo worlds are read-mostly: identical
+// (query, history-shape) recall reruns are pure latency waste. Entries
+// are keyed on the rewritten query and expire after TTL_MS; a write to
+// the world would need explicit invalidation, so the TTL is short by
+// design (the tool-loop fallback path bypasses the cache entirely).
+const RECALL_CACHE = new Map();
+const RECALL_CACHE_TTL_MS = 60_000;
+const RECALL_CACHE_MAX = 200;
+
 async function fetchJson(path, body, signal) {
   const response = await fetch(`https://data.wazoo.dev${path}`, {
     method: "POST",
@@ -119,7 +128,7 @@ function expand(token) {
   return [...variants];
 }
 
-async function retrieve(question, history = [], signal) {
+async function retrieve(question, history = [], signal, { useCache = true } = {}) {
   const rewritten = rewrite(question, history);
   // Keyword-only search matches literal substrings, so query per keyword
   // and merge subjects. (Swap for one hybrid query once embeddings are on.)
@@ -132,6 +141,15 @@ async function retrieve(question, history = [], signal) {
   // Expansions come after every base token so a content word can never be
   // crowded out of the search budget by variant junk.
   const tokens = [...new Set([...base, ...base.flatMap(expand)])].slice(0, 6);
+  const cacheKey = `${rewritten.toLowerCase()}`;
+  if (useCache && !signal && RECALL_CACHE.has(cacheKey)) {
+    const hit = RECALL_CACHE.get(cacheKey);
+    if (Date.now() - hit.at < RECALL_CACHE_TTL_MS) {
+      console.error(`retrieval cache hit: ${cacheKey}`);
+      return hit.value;
+    }
+    RECALL_CACHE.delete(cacheKey);
+  }
   const bySubject = new Map();
   await Promise.all(
     tokens.map(async (token) => {
@@ -173,7 +191,17 @@ async function retrieve(question, history = [], signal) {
       facts.push(`${b.s.value} ${b.p.value} ${b.o.value}`);
     }
   }
-  return { hits, facts, tokens };
+  const result = { hits, facts, tokens };
+  if (useCache) {
+    RECALL_CACHE.set(cacheKey, { at: Date.now(), value: result });
+    if (RECALL_CACHE.size > RECALL_CACHE_MAX) {
+      const oldest = [...RECALL_CACHE.entries()].sort(
+        (a, b) => a[1].at - b[1].at,
+      )[0];
+      if (oldest) RECALL_CACHE.delete(oldest[0]);
+    }
+  }
+  return result;
 }
 const STOPWORDS = new Set([
   "the", "and", "for", "what", "who", "how", "are", "you", "hey",
