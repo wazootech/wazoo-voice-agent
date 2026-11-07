@@ -42,15 +42,78 @@ const recall = createRecallTools({ client: hosted });
 // retrieve-then-speak: deterministic recall pre-pass, then a tool-less
 // streaming answer. The tool loop below is the fallback when retrieval
 // comes up empty.
-async function retrieve(question) {
+// Query-time rewrite (worlds-sdk-ts#215 H1-lite): the hosted index matches
+// literal substrings, so pronouns and inflections lose recall. Substitute
+// pronouns with entity labels from recent conversation, expand tokens with
+// light stemming, all without embeddings.
+const PRONOUNS = new Set([
+  "he", "she", "it", "his", "her", "its", "him", "they", "them", "their",
+]);
+
+const GREETINGS = new Set(["hey", "hi", "hello", "ok", "okay", "so", "well"]);
+
+function rewrite(question, history) {
+  // Collect the proper names the conversation has already established.
+  // Answers only: STT-mangled questions spell entities inconsistently.
+  const names = new Set();
+  for (const turn of history.slice(-3)) {
+    for (const m of turn.answer.matchAll(
+      /\b[A-Z][a-z]+(?: [A-Z][a-z]+)*\b/g,
+    )) {
+      const words = m[0].split(/\s+/);
+      while (words.length && GREETINGS.has(words[0].toLowerCase())) {
+        words.shift();
+      }
+      const name = words.join(" ");
+      if (name && !PRONOUNS.has(name.toLowerCase())) names.add(name);
+    }
+  }
+  let resolved = question;
+  for (const name of names) {
+    resolved = resolved.replace(
+      new RegExp(`\\b(his|her|its|their)\\b`, "gi"),
+      `${name}'s`,
+    );
+    resolved = resolved.replace(
+      new RegExp(`\\b(he|she|it|they)\\b`, "gi"),
+      name,
+    );
+    resolved = resolved.replace(
+      new RegExp(`\\b(him|her|it|them)\\b`, "gi"),
+      name,
+    );
+  }
+  return resolved;
+}
+
+const SUFFIXES = ["'s", "s", "es", "ing", "ed"];
+
+function expand(token) {
+  const variants = new Set([token]);
+  for (const suf of SUFFIXES) {
+    if (token.endsWith(suf) && token.length - suf.length >= 3) {
+      variants.add(token.slice(0, -suf.length));
+    }
+  }
+  for (const suf of SUFFIXES) {
+    if (!token.endsWith(suf)) variants.add(token + suf);
+  }
+  return [...variants];
+}
+
+async function retrieve(question, history = []) {
+  const rewritten = rewrite(question, history);
   // Keyword-only search matches literal substrings, so query per keyword
   // and merge subjects. (Swap for one hybrid query once embeddings are on.)
-  const tokens = question
+  const base = rewritten
     .toLowerCase()
     .replace(/[^a-z0-9 ]/g, " ")
     .split(/\s+/)
     .filter((t) => t.length > 2 && !STOPWORDS.has(t))
     .slice(0, 3);
+  // Expansions come after every base token so a content word can never be
+  // crowded out of the search budget by variant junk.
+  const tokens = [...new Set([...base, ...base.flatMap(expand)])].slice(0, 6);
   const bySubject = new Map();
   await Promise.all(
     tokens.map(async (token) => {
@@ -69,11 +132,22 @@ async function retrieve(question) {
   const hits = [...bySubject.values()].slice(0, 6);
   const facts = [];
   if (hits.length > 0) {
-    const values = hits.map((h) => `<${h.subject}>`).join(" ");
-    const res = await hosted.sparql({
-      query: `SELECT ?s ?p ?o WHERE { VALUES ?s { ${values} } ?s ?p ?o }`,
-    });
-    for (const b of res?.data?.results?.bindings ?? []) {
+    const iris = [...new Set(hits.map((h) => h.subject))];
+    const values = iris.map((i) => `<${i}>`).join(" ");
+    // Forward: the hit subject's own triples. Reverse: triples that point
+    // AT the hit subject ("who manages Ethan" lives on the projects).
+    const [fwd, rev] = await Promise.all([
+      hosted.sparql({
+        query: `SELECT ?s ?p ?o WHERE { VALUES ?s { ${values} } ?s ?p ?o }`,
+      }),
+      hosted.sparql({
+        query: `SELECT ?s ?p ?o WHERE { VALUES ?o { ${values} } ?s ?p ?o }`,
+      }),
+    ]);
+    for (const b of fwd?.data?.results?.bindings ?? []) {
+      facts.push(`${b.s.value} ${b.p.value} ${b.o.value}`);
+    }
+    for (const b of rev?.data?.results?.bindings ?? []) {
       facts.push(`${b.s.value} ${b.p.value} ${b.o.value}`);
     }
   }
@@ -197,7 +271,7 @@ async function runTurn(wavPath, tts) {
       turn.transcript.trim().split(/\s+/).length >= 4
     ) {
       prefetchText = turn.transcript.trim();
-      prefetch = retrieve(prefetchText).catch(() => null);
+      prefetch = retrieve(prefetchText, history).catch(() => null);
     }
   });
 
@@ -221,14 +295,16 @@ async function runTurn(wavPath, tts) {
   // Recall: reuse prefetch unless the final transcript changed materially.
   // Reuse the prefetch unless the final transcript changed materially
   // (STT spelling wobble like "Wazu"/"Wazoo" should not cost a re-run).
+  const rewritten = rewrite(finalText, history);
   const norm = (t) => t.toLowerCase().replace(/[^a-z0-9]/g, "");
   let retrieved = prefetch ? await prefetch : null;
   if (!retrieved || norm(prefetchText) !== norm(finalText)) {
-    retrieved = await retrieve(finalText);
+    retrieved = await retrieve(finalText, history);
   }
   console.error(
     `retrieved (${Date.now() - t}ms): ${retrieved.facts.length} facts from ${retrieved.hits.length} hits`,
   );
+  if (history.length > 0) console.error(`rewritten query: ${rewritten}`);
 
   // Answer stream: facts context plus recent conversation history.
   const convo = history
