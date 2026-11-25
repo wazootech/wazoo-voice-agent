@@ -20,11 +20,12 @@ const hostedClient = createClient({
 });
 
 const hosted = {
-  search: async ({ query, topK, minScore }) => {
+  search: async ({ query, topK, minScore }, { signal } = {}) => {
     const response = await searchWorld({
       client: hostedClient,
       path: { worldId },
       body: { query, limit: topK, minScore },
+      signal,
     });
     return response.data;
   },
@@ -42,6 +43,32 @@ const recall = createRecallTools({ client: hosted });
 // retrieve-then-speak: deterministic recall pre-pass, then a tool-less
 // streaming answer. The tool loop below is the fallback when retrieval
 // comes up empty.
+// Pre-pass calls go through raw fetch so the AbortController actually
+// cancels the HTTP request on supersede (the generated client drops the
+// signal). Tool-loop calls below keep using the hosted client.
+// Pre-pass result cache. Demo worlds are read-mostly: identical
+// (query, history-shape) recall reruns are pure latency waste. Entries
+// are keyed on the rewritten query and expire after TTL_MS; a write to
+// the world would need explicit invalidation, so the TTL is short by
+// design (the tool-loop fallback path bypasses the cache entirely).
+const RECALL_CACHE = new Map();
+const RECALL_CACHE_TTL_MS = 60_000;
+const RECALL_CACHE_MAX = 200;
+
+async function fetchJson(path, body, signal) {
+  const response = await fetch(`https://data.wazoo.dev${path}`, {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${process.env.WORLDS_TOKEN}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify(body),
+    signal,
+  });
+  if (!response.ok) throw new Error(`${path}: ${response.status}`);
+  return response.json();
+}
+
 // Query-time rewrite (worlds-sdk-ts#215 H1-lite): the hosted index matches
 // literal substrings, so pronouns and inflections lose recall. Substitute
 // pronouns with entity labels from recent conversation, expand tokens with
@@ -105,7 +132,7 @@ function expand(token) {
   return [...variants];
 }
 
-async function retrieve(question, history = []) {
+async function retrieve(question, history = [], signal, { useCache = true } = {}) {
   const rewritten = rewrite(question, history);
   // Keyword-only search matches literal substrings, so query per keyword
   // and merge subjects. (Swap for one hybrid query once embeddings are on.)
@@ -118,10 +145,23 @@ async function retrieve(question, history = []) {
   // Expansions come after every base token so a content word can never be
   // crowded out of the search budget by variant junk.
   const tokens = [...new Set([...base, ...base.flatMap(expand)])].slice(0, 6);
+  const cacheKey = `${rewritten.toLowerCase()}`;
+  if (useCache && !signal && RECALL_CACHE.has(cacheKey)) {
+    const hit = RECALL_CACHE.get(cacheKey);
+    if (Date.now() - hit.at < RECALL_CACHE_TTL_MS) {
+      console.error(`retrieval cache hit: ${cacheKey}`);
+      return hit.value;
+    }
+    RECALL_CACHE.delete(cacheKey);
+  }
   const bySubject = new Map();
   await Promise.all(
     tokens.map(async (token) => {
-      const search = await hosted.search({ query: token, topK: 5 });
+      const search = await fetchJson(
+        `/worlds/${worldId}/search`,
+        { query: token, limit: 5 },
+        signal,
+      );
       for (const h of search?.results ?? []) {
         if (
           h.subject &&
@@ -141,21 +181,31 @@ async function retrieve(question, history = []) {
     // Forward: the hit subject's own triples. Reverse: triples that point
     // AT the hit subject ("who manages Ethan" lives on the projects).
     const [fwd, rev] = await Promise.all([
-      hosted.sparql({
+      fetchJson(`/worlds/${worldId}/sparql`, {
         query: `SELECT ?s ?p ?o WHERE { VALUES ?s { ${values} } ?s ?p ?o }`,
-      }),
-      hosted.sparql({
+      }, signal),
+      fetchJson(`/worlds/${worldId}/sparql`, {
         query: `SELECT ?s ?p ?o WHERE { VALUES ?o { ${values} } ?s ?p ?o }`,
-      }),
+      }, signal),
     ]);
-    for (const b of fwd?.data?.results?.bindings ?? []) {
+    for (const b of fwd?.results?.bindings ?? []) {
       facts.push(`${b.s.value} ${b.p.value} ${b.o.value}`);
     }
-    for (const b of rev?.data?.results?.bindings ?? []) {
+    for (const b of rev?.results?.bindings ?? []) {
       facts.push(`${b.s.value} ${b.p.value} ${b.o.value}`);
     }
   }
-  return { hits, facts, tokens };
+  const result = { hits, facts, tokens };
+  if (useCache) {
+    RECALL_CACHE.set(cacheKey, { at: Date.now(), value: result });
+    if (RECALL_CACHE.size > RECALL_CACHE_MAX) {
+      const oldest = [...RECALL_CACHE.entries()].sort(
+        (a, b) => a[1].at - b[1].at,
+      )[0];
+      if (oldest) RECALL_CACHE.delete(oldest[0]);
+    }
+  }
+  return result;
 }
 const STOPWORDS = new Set([
   "the", "and", "for", "what", "who", "how", "are", "you", "hey",
@@ -265,17 +315,23 @@ async function runTurn(wavPath, tts) {
 
   let prefetch = null;
   let prefetchText = "";
+  let prefetchAbort = null;
   const finals = [];
   transcriber.on("turn", (turn) => {
     if (turn.end_of_turn && turn.transcript) {
       finals.push(turn.transcript);
     } else if (
-      !prefetch &&
       turn.transcript &&
       turn.transcript.trim().split(/\s+/).length >= 4
     ) {
+      // Supersede: a newer partial aborts the in-flight retrieval and
+      // starts a fresh one, so a self-correction ("restart it... actually,
+      // reset it") never answers from the first reading.
+      if (prefetchAbort) prefetchAbort.abort();
       prefetchText = turn.transcript.trim();
-      prefetch = retrieve(prefetchText, history).catch(() => null);
+      prefetchAbort = new AbortController();
+      const mine = prefetchAbort.signal;
+      prefetch = retrieve(prefetchText, history, mine).catch(() => null);
     }
   });
 
@@ -299,8 +355,12 @@ async function runTurn(wavPath, tts) {
   // Recall: reuse prefetch unless the final transcript changed materially.
   // Reuse the prefetch unless the final transcript changed materially
   // (STT spelling wobble like "Wazu"/"Wazoo" should not cost a re-run).
+  // The final transcript always wins: abort any in-flight prefetch and
+  // rerun on the final unless a superseding prefetch already matches it
+  // (STT spelling wobble like "Wazu"/"Wazoo" should not cost a re-run).
   const rewritten = rewrite(finalText, history);
   const norm = (t) => t.toLowerCase().replace(/[^a-z0-9]/g, "");
+  if (prefetchAbort) prefetchAbort.abort();
   let retrieved = prefetch ? await prefetch : null;
   if (!retrieved || norm(prefetchText) !== norm(finalText)) {
     retrieved = await retrieve(finalText, history);
